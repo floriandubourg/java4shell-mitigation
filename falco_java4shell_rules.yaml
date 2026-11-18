@@ -1,0 +1,145 @@
+# =============================================================================
+# Falco rules for Java4Shell (CVE-2026-114938)
+#
+# IMPORTANT – what Falco can and cannot see here.
+#
+# CVE-2026-114938 is an out-of-bounds *heap write* inside the JVM's AVX-512 Base64
+# decode intrinsic. The corruption happens entirely in user-space JVM memory and
+# issues NO syscall, so Falco (a syscall/eBPF runtime sensor) cannot observe the
+# bug itself, nor the malformed Base64 input, which is just bytes inside a normal
+# request. There is no reliable syscall signature for "a 65-byte Base64 string was
+# decoded".
+#
+# These rules watch activity that may follow exploitation or have benign causes:
+#
+#   1. A JVM process spawning a shell, interpreter, or system/network tool.
+#      This can follow remote code execution, but does not prove exploitation.
+#   2. Instability: the JVM writing crash artefacts (hs_err_pid*.log, core dumps).
+#      Heap corruption can crash the JVM, but crashes also have unrelated causes.
+#      Correlate with other evidence, including untrusted input.
+#   3. Attach-API abuse: new JVM attach sockets (/tmp/.java_pid*) or `jcmd ...
+#      JVMTI.agent_load` invocations. The official runtime mitigation uses exactly
+#      this path. These rules observe selected commands and file writes, not
+#      successful agent loading or all attach activity.
+#
+# Tested against Falco rules engine v22+ (Falco 0.37+). Load with:
+#   falco -r /etc/falco/falco_rules.yaml -r security/falco/java4shell_rules.yaml
+# =============================================================================
+- required_engine_version: 22
+
+# ---- tunables ---------------------------------------------------------------
+# Names of the JVM launcher processes to watch.
+- list: java_process_names
+  items: [java, javaw]
+
+# Shells, interpreters, and tools to watch when launched by a JVM.
+- list: java4shell_suspect_children
+  items:
+    - sh, bash, dash, ash, zsh, ksh, csh, tcsh
+    - python, python2, python3, perl, ruby, php, node, lua
+    - nc, ncat, netcat, socat, curl, wget, telnet
+    - whoami, id, uname, hostname, ifconfig, ip, netstat, ss
+    - chmod, chown, base64, xxd, nohup
+
+# Agent filenames for reference. The rule below uses a literal command-line
+# substring, not this list. A filename match does not authenticate jar contents
+# or establish that an attach is benign.
+- list: java4shell_allowed_agents
+  items:
+    - CVE-2026-114938.jar
+
+# Parent process names to exclude when child processes are expected
+# (for example, build servers or applications that run shell commands).
+- list: java4shell_benign_java_parents
+  items: []
+
+# ---- macros -----------------------------------------------------------------
+- macro: spawned_process
+  condition: (evt.type in (execve, execveat) and evt.dir = <)
+
+- macro: parent_is_jvm
+  condition: (proc.pname in (java_process_names) or proc.aname[2] in (java_process_names))
+
+- macro: open_for_write
+  condition: (evt.type in (open, openat, openat2, creat) and evt.is_open_write = true and evt.dir = <)
+
+# ---- rules ------------------------------------------------------------------
+
+# 1) A JVM (or a descendant of it) runs a listed shell or tool.
+- rule: Java4Shell JVM Spawned Suspicious Process
+  desc: >
+    A JVM spawned a shell, scripting interpreter, or network/recon tool. For a Java
+    server this is a common sign of remote code execution, including exploitation of
+    CVE-2026-114938 (Java4Shell). Investigate the parent JVM, the request that
+    preceded it, and the command line.
+  condition: >
+    spawned_process
+    and parent_is_jvm
+    and proc.name in (java4shell_suspect_children)
+    and not proc.pname in (java4shell_benign_java_parents)
+  output: >
+    JVM spawned a suspicious child process (possible Java4Shell/CVE-2026-114938 RCE)
+    parent=%proc.pname child=%proc.name cmdline=%proc.cmdline
+    user=%user.name uid=%user.uid pid=%proc.pid ppid=%proc.ppid
+    cwd=%proc.cwd container=%container.name image=%container.image.repository
+  priority: CRITICAL
+  tags: [java4shell, cve-2026-114938, process, mitre_execution, T1059]
+
+# 2) JVM crash-related file writes; these do not identify the cause.
+- rule: Java4Shell JVM Crash Artifact Written
+  desc: >
+    A JVM wrote a HotSpot crash log (hs_err_pid*.log) or a core dump. Memory-corruption
+    exploitation of CVE-2026-114938 frequently crashes the JVM when the heap grooming
+    is imperfect. Correlate with inbound requests and repeated crashes.
+  condition: >
+    open_for_write
+    and proc.name in (java_process_names)
+    and (fd.name glob "*hs_err_pid*.log"
+         or fd.name glob "*/core.*"
+         or fd.name glob "*/replay_pid*.log")
+  output: >
+    JVM wrote a crash artifact (possible Java4Shell/CVE-2026-114938 exploitation attempt)
+    file=%fd.name proc=%proc.name pid=%proc.pid user=%user.name
+    container=%container.name image=%container.image.repository
+  priority: WARNING
+  tags: [java4shell, cve-2026-114938, crash, filesystem]
+
+# 3a) A jcmd command line requests an agent load; success is not established.
+#     The filename substring exception also suppresses unrelated command lines
+#     containing that name. It does not verify the agent's path or contents.
+- rule: Java4Shell Unexpected JVM Agent Load
+  desc: >
+    A jcmd command line requested JVMTI.agent_load, as used by the
+    CVE-2026-114938 runtime patch and potentially by malicious agents. This does not
+    establish a successful load. Command lines containing CVE-2026-114938.jar are
+    excluded by a filename substring match, not by verification of the jar.
+  condition: >
+    spawned_process
+    and proc.name = jcmd
+    and proc.cmdline contains "JVMTI.agent_load"
+    and not proc.cmdline contains "CVE-2026-114938.jar"
+  output: >
+    Unexpected JVM agent load via Attach API (review for Java4Shell tampering)
+    cmdline=%proc.cmdline user=%user.name uid=%user.uid pid=%proc.pid
+    container=%container.name image=%container.image.repository
+  priority: NOTICE
+  tags: [java4shell, cve-2026-114938, jvm-attach, audit]
+
+# 3b) Writes to attach-related paths. This open-for-write rule does not prove
+#     socket creation, a successful attach, or an agent load, and can miss those
+#     activities. It is not a complete record of Attach API use.
+- rule: Java4Shell JVM Attach Socket Created
+  desc: >
+    A process opened a path matching /tmp/.java_pid* or */.attach_pid* for writing.
+    Such paths can be associated with JVM attach activity, including the
+    CVE-2026-114938 runtime patch. This does not prove socket creation, a successful
+    attach, or an agent load. Review the process and correlate with other evidence.
+  condition: >
+    open_for_write
+    and (fd.name glob "/tmp/.java_pid*" or fd.name glob "*/.attach_pid*")
+  output: >
+    Write-open on a JVM attach-related path (attach or agent load not confirmed)
+    file=%fd.name proc=%proc.name pid=%proc.pid user=%user.name
+    container=%container.name image=%container.image.repository
+  priority: INFORMATIONAL
+  tags: [java4shell, cve-2026-114938, jvm-attach, audit]

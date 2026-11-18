@@ -1,0 +1,4 @@
+Agent-Class: CVE_2026_114938
+Premain-Class: CVE_2026_114938
+Can-Retransform-Classes: true
+Can-Redefine-Classes: true
